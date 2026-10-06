@@ -1,0 +1,1272 @@
+package com.example.ui
+
+import android.Manifest
+import android.app.Application
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontFamily
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import com.example.encode.EncodeQueueManager
+import com.example.model.SubtitleCue
+import com.example.model.SubtitleHorizontalAlign
+import com.example.model.SubtitleStyle
+import com.example.model.SubtitleVerticalAlign
+import com.example.parser.AssGenerator
+import com.example.parser.SubtitleParser
+import com.example.search.AnimeSearchException
+import com.example.search.AnimeSearchRepository
+import com.example.search.AnimeSearchResult
+import com.example.search.AnimeSearchUiState
+import com.example.search.AnimeSource
+import com.example.search.VideoQuality
+import com.example.update.AppUpdater
+import com.example.update.UpdateState
+import com.example.util.FontManager
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import java.io.File
+
+enum class AppScreen {
+    MAIN_MENU,
+    EDITOR,
+    ANIME_SEARCH
+}
+
+data class AxiSubUiState(
+    val currentScreen: AppScreen = AppScreen.MAIN_MENU,
+    val videoUri: Uri? = null,
+    val videoTitle: String? = null,
+    val isPlaying: Boolean = false,
+    val currentPositionMs: Long = 0L,
+    val durationMs: Long = 0L,
+    val playbackSpeed: Float = 1.0f,
+    val subtitles: List<SubtitleCue> = emptyList(),
+    val subtitleFileName: String? = null,
+    val activeCues: List<SubtitleCue> = emptyList(),
+    val subtitleStyle: SubtitleStyle = SubtitleStyle(),
+    val additionalStyles: List<String> = emptyList(),
+    val loadedFontFamily: FontFamily? = null,
+    val customFontName: String? = null,
+    val selectedTab: Int = 0, // 0: Altyazı Listesi, 1: Font & Biçim, 2: Video Bilgisi
+    val searchQuery: String = "",
+    val isFullscreen: Boolean = false,
+    val isLoading: Boolean = false,
+    val errorMessage: String? = null,
+    val statusMessage: String? = null,
+    val editingCue: SubtitleCue? = null,
+    val generatedAssContent: String = "",
+    val showExportDialog: Boolean = false,
+    val showEncodeDialog: Boolean = false,
+    val wasConvertedFromSrt: Boolean = false,
+    val encodingSettings: com.example.encode.EncodingSettings = com.example.encode.EncodingSettings(),
+    val sourceVideoMetadata: com.example.encode.SourceVideoMetadata = com.example.encode.SourceVideoMetadata(),
+    val showCompatibilityDialog: Boolean = false,
+    val isCompatibilityTestRunning: Boolean = false,
+    val compatibilityTestResults: List<com.example.encode.CompatibilityTestItem> = emptyList(),
+    val showMkvExtractionDialog: Boolean = false,
+    val isInspectingMkv: Boolean = false,
+    val isExtractingMkvSubtitle: Boolean = false,
+    val mkvFileName: String = "",
+    val mkvFileReference: File? = null,
+    val mkvSubtitleTracks: List<com.example.mkv.MkvSubtitleTrack> = emptyList(),
+    val selectedMkvTrack: com.example.mkv.MkvSubtitleTrack? = null,
+    val extractedSubtitleFile: File? = null,
+    val mkvExtractionErrorMessage: String? = null,
+    val isHardsubVideoPlaying: Boolean = false,
+    val introVideoUri: Uri? = null,
+    val introVideoTitle: String? = null,
+    val introVideoDurationMs: Long = 0L,
+    val introVideoWidth: Int = 0,
+    val introVideoHeight: Int = 0,
+    val introVideoFps: Double = 30.0,
+    val introKeepAudio: Boolean = false,
+    val showIntroPreview: Boolean = false,
+    val canUndo: Boolean = false,
+    val canRedo: Boolean = false,
+    val selectedCueId: Int? = null,
+    val showEncodeTasksDialog: Boolean = false,
+    val showBatchTagDialog: Boolean = false
+)
+
+class AxiSubViewModel(application: Application) : AndroidViewModel(application) {
+
+    init {
+        EncodeQueueManager.recoverInterruptedTasks(application)
+    }
+
+    private val _uiState = MutableStateFlow(AxiSubUiState())
+    val uiState: StateFlow<AxiSubUiState> = _uiState.asStateFlow()
+
+    private val undoStack = java.util.ArrayDeque<List<SubtitleCue>>()
+    private val redoStack = java.util.ArrayDeque<List<SubtitleCue>>()
+
+    private fun pushUndoState(cues: List<SubtitleCue>) {
+        if (undoStack.size >= 50) {
+            undoStack.removeLast()
+        }
+        undoStack.push(cues)
+        redoStack.clear()
+        _uiState.update { it.copy(canUndo = true, canRedo = false) }
+    }
+
+    fun undo() {
+        if (undoStack.isEmpty()) return
+        val current = _uiState.value.subtitles
+        val previous = undoStack.pop()
+        redoStack.push(current)
+        _uiState.update { state ->
+            state.copy(
+                subtitles = previous,
+                generatedAssContent = generateAssString(previous, state.subtitleStyle, state.subtitleFileName),
+                canUndo = undoStack.isNotEmpty(),
+                canRedo = true,
+                statusMessage = "İşlem geri alındı"
+            )
+        }
+        updateActiveCues(_uiState.value.currentPositionMs)
+    }
+
+    fun redo() {
+        if (redoStack.isEmpty()) return
+        val current = _uiState.value.subtitles
+        val next = redoStack.pop()
+        undoStack.push(current)
+        _uiState.update { state ->
+            state.copy(
+                subtitles = next,
+                generatedAssContent = generateAssString(next, state.subtitleStyle, state.subtitleFileName),
+                canUndo = true,
+                canRedo = redoStack.isNotEmpty(),
+                statusMessage = "İşlem yinelendi"
+            )
+        }
+        updateActiveCues(_uiState.value.currentPositionMs)
+    }
+
+    fun selectCue(cueId: Int?) {
+        _uiState.update { it.copy(selectedCueId = cueId) }
+    }
+
+    fun duplicateCue(cue: SubtitleCue) {
+        val current = _uiState.value.subtitles
+        pushUndoState(current)
+        val maxId = current.maxOfOrNull { it.id } ?: 0
+        val newCue = cue.copy(
+            id = maxId + 1,
+            startTimeMs = cue.endTimeMs + 50L,
+            endTimeMs = cue.endTimeMs + 50L + (cue.endTimeMs - cue.startTimeMs).coerceAtLeast(1000L)
+        )
+        val updated = (current + newCue).sortedBy { it.startTimeMs }
+        _uiState.update { state ->
+            state.copy(
+                subtitles = updated,
+                selectedCueId = newCue.id,
+                generatedAssContent = generateAssString(updated, state.subtitleStyle, state.subtitleFileName),
+                statusMessage = "Altyazı kopyalandı (#${newCue.id})"
+            )
+        }
+        updateActiveCues(_uiState.value.currentPositionMs)
+    }
+
+    fun splitCue(cue: SubtitleCue) {
+        val current = _uiState.value.subtitles
+        val duration = cue.endTimeMs - cue.startTimeMs
+        if (duration < 500L) {
+            _uiState.update { it.copy(statusMessage = "Altyazı süresi bölmek için çok kısa") }
+            return
+        }
+        pushUndoState(current)
+        val midTime = cue.startTimeMs + (duration / 2)
+        val maxId = current.maxOfOrNull { it.id } ?: 0
+
+        val words = cue.rawText.split(" ")
+        val (firstPart, secondPart) = if (words.size >= 2) {
+            val half = words.size / 2
+            Pair(words.take(half).joinToString(" "), words.drop(half).joinToString(" "))
+        } else {
+            Pair(cue.rawText, cue.rawText)
+        }
+
+        val firstCue = cue.copy(
+            endTimeMs = midTime,
+            rawText = firstPart,
+            cleanText = com.example.parser.HtmlSubtitleParser.cleanToPlainText(firstPart)
+        )
+        val secondCue = cue.copy(
+            id = maxId + 1,
+            startTimeMs = midTime + 50L,
+            rawText = secondPart,
+            cleanText = com.example.parser.HtmlSubtitleParser.cleanToPlainText(secondPart)
+        )
+
+        val updated = current.map { if (it.id == cue.id) firstCue else it } + secondCue
+        val sorted = updated.sortedBy { it.startTimeMs }
+        _uiState.update { state ->
+            state.copy(
+                subtitles = sorted,
+                selectedCueId = firstCue.id,
+                generatedAssContent = generateAssString(sorted, state.subtitleStyle, state.subtitleFileName),
+                statusMessage = "Altyazı bölündü"
+            )
+        }
+        updateActiveCues(_uiState.value.currentPositionMs)
+    }
+
+    fun replaceTextInAllCues(target: String, replacement: String) {
+        if (target.isEmpty()) return
+        val current = _uiState.value.subtitles
+        pushUndoState(current)
+        var count = 0
+        val updated = current.map { cue ->
+            if (cue.rawText.contains(target, ignoreCase = false)) {
+                count++
+                val newRaw = cue.rawText.replace(target, replacement)
+                cue.copy(
+                    rawText = newRaw,
+                    cleanText = com.example.parser.HtmlSubtitleParser.cleanToPlainText(newRaw)
+                )
+            } else cue
+        }
+        _uiState.update { state ->
+            state.copy(
+                subtitles = updated,
+                generatedAssContent = generateAssString(updated, state.subtitleStyle, state.subtitleFileName),
+                statusMessage = "$count satırda değiştirildi"
+            )
+        }
+        updateActiveCues(_uiState.value.currentPositionMs)
+    }
+
+    // Event to signal player to seek to timestamp
+    private val _seekEvent = MutableSharedFlow<Long>(extraBufferCapacity = 1)
+    val seekEvent: SharedFlow<Long> = _seekEvent.asSharedFlow()
+
+    val torrentDownloadInfo: StateFlow<com.example.torrent.TorrentDownloadInfo> =
+        com.example.torrent.TorrentDownloadManager.downloadInfo
+
+    private val _animeSearchState = MutableStateFlow(AnimeSearchUiState())
+    val animeSearchState: StateFlow<AnimeSearchUiState> = _animeSearchState.asStateFlow()
+    private var animeSearchJob: Job? = null
+
+    private val _updateState = MutableStateFlow<UpdateState>(UpdateState.Idle)
+    val updateState: StateFlow<UpdateState> = _updateState.asStateFlow()
+    private var updateJob: Job? = null
+
+    init {
+        // Load default sample demo on first startup so emulator has immediate working preview
+        loadDemoMedia()
+        checkForUpdates()
+    }
+
+    private fun generateAssString(
+        subtitles: List<SubtitleCue>,
+        style: SubtitleStyle,
+        title: String? = null,
+        additionalStyles: List<String> = _uiState.value.additionalStyles
+    ): String {
+        val name = title ?: _uiState.value.subtitleFileName ?: "remsubs_altyazi.ass"
+        val vidWidth = _uiState.value.sourceVideoMetadata.width.let { if (it > 0) it else 1920 }
+        val vidHeight = _uiState.value.sourceVideoMetadata.height.let { if (it > 0) it else 1080 }
+        return AssGenerator.generateAss(
+            title = name,
+            subtitles = subtitles,
+            style = style,
+            applyTimeOffset = false,
+            videoWidth = vidWidth,
+            videoHeight = vidHeight,
+            additionalStyles = additionalStyles
+        )
+    }
+
+    fun loadDemoMedia() {
+        viewModelScope.launch {
+            _uiState.update { it.copy(isLoading = true, errorMessage = null) }
+            val demoAss = SubtitleParser.getSampleAssContent()
+            val parsedCues = SubtitleParser.parseAss(demoAss)
+            val demoStyles = SubtitleParser.extractAssStyles(demoAss)
+            val demoDefaultStyle = SubtitleParser.parseAssDefaultStyle(demoAss) ?: SubtitleStyle()
+
+            // Use bundled local sample video in raw resources (offline & error-free)
+            val context = getApplication<Application>()
+            val demoVideoUri = Uri.parse("android.resource://${context.packageName}/raw/sample_demo")
+
+            _uiState.update {
+                it.copy(
+                    videoUri = demoVideoUri,
+                    videoTitle = "Örnek Video (remsubs demo.mp4)",
+                    subtitles = parsedCues,
+                    subtitleFileName = "ornek_demo.ass",
+                    generatedAssContent = demoAss,
+                    additionalStyles = demoStyles,
+                    subtitleStyle = demoDefaultStyle,
+                    wasConvertedFromSrt = false,
+                    isHardsubVideoPlaying = false,
+                    isLoading = false,
+                    errorMessage = null,
+                    statusMessage = "Örnek video ve .ASS altyazı yüklendi (Demo Modu)"
+                )
+            }
+            updateActiveCues(0L)
+        }
+    }
+
+    fun loadLocalVideo(uri: Uri) {
+        val context = getApplication<Application>()
+        val title = FontManager.getFileName(context, uri) ?: "Yerel Video"
+        _uiState.update {
+            it.copy(
+                videoUri = uri,
+                videoTitle = title,
+                isHardsubVideoPlaying = false,
+                errorMessage = null,
+                statusMessage = "Lokal video önizlemeye alındı: $title"
+            )
+        }
+        extractVideoMetadata(uri)
+    }
+
+    private fun extractVideoMetadata(uri: Uri?) {
+        if (uri == null) return
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val context = getApplication<Application>()
+                val metadata = com.example.encode.InputVideoAnalyzer.analyzeVideo(context, null, uri)
+                _uiState.update { it.copy(sourceVideoMetadata = metadata) }
+            } catch (e: Exception) {
+                android.util.Log.e("AxiSubViewModel", "Error analyzing video metadata", e)
+            }
+        }
+    }
+
+    fun updateVideoDimensions(width: Int, height: Int) {
+        if (width > 0 && height > 0) {
+            _uiState.update {
+                if (it.sourceVideoMetadata.width != width || it.sourceVideoMetadata.height != height) {
+                    it.copy(
+                        sourceVideoMetadata = it.sourceVideoMetadata.copy(
+                            width = width,
+                            height = height
+                        )
+                    )
+                } else it
+            }
+        }
+    }
+
+    fun loadSubtitleFromUri(uri: Uri) {
+        viewModelScope.launch {
+            _uiState.update { it.copy(isLoading = true) }
+            val context = getApplication<Application>()
+            try {
+                val fileName = FontManager.getFileName(context, uri) ?: "altyazi.ass"
+                val rawContent = context.contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }?.removePrefix("\uFEFF")
+                if (rawContent != null) {
+                    val cues = SubtitleParser.parse(rawContent.byteInputStream(Charsets.UTF_8), fileName)
+                    val isSrt = fileName.lowercase().endsWith(".srt")
+                    val targetFileName = if (isSrt) {
+                        fileName.replace(Regex("(?i)\\.srt$"), ".ass")
+                    } else {
+                        fileName
+                    }
+                    val additionalStyles = if (!isSrt) SubtitleParser.extractAssStyles(rawContent) else emptyList()
+                    val parsedDefaultStyle = if (!isSrt) SubtitleParser.parseAssDefaultStyle(rawContent) else null
+                    val effectiveStyle = parsedDefaultStyle ?: _uiState.value.subtitleStyle
+
+                    val assContent = if (!isSrt && rawContent.contains("[Events]")) {
+                        rawContent
+                    } else {
+                        generateAssString(
+                            subtitles = cues,
+                            style = effectiveStyle,
+                            title = targetFileName,
+                            additionalStyles = additionalStyles
+                        )
+                    }
+
+                    _uiState.update {
+                        it.copy(
+                            subtitles = cues,
+                            subtitleFileName = targetFileName,
+                            generatedAssContent = assContent,
+                            additionalStyles = additionalStyles,
+                            subtitleStyle = effectiveStyle,
+                            wasConvertedFromSrt = isSrt,
+                            isLoading = false,
+                            statusMessage = if (isSrt) {
+                                "SRT altyazısı .ASS formatına dönüştürüldü ve editöre aktarıldı (${cues.size} satır)"
+                            } else {
+                                "$fileName yüklendi (${cues.size} satır altyazı)"
+                            }
+                        )
+                    }
+                    updateActiveCues(_uiState.value.currentPositionMs)
+                } else {
+                    _uiState.update {
+                        it.copy(
+                            isLoading = false,
+                            statusMessage = "Altyazı dosyası okunamadı!"
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                _uiState.update {
+                    it.copy(
+                        isLoading = false,
+                        statusMessage = "Altyazı hatası: ${e.localizedMessage}"
+                    )
+                }
+            }
+        }
+    }
+
+    fun loadTtfFontFromUri(uri: Uri) {
+        viewModelScope.launch {
+            _uiState.update { it.copy(isLoading = true) }
+            val context = getApplication<Application>()
+            val result = FontManager.copyTtfToInternalStorage(context, uri)
+            if (result != null) {
+                val (fileName, fontFile) = result
+                val fontFamily = FontManager.createFontFamilyFromFile(fontFile)
+                if (fontFamily != null) {
+                    _uiState.update { state ->
+                        val updatedStyle = state.subtitleStyle.copy(
+                            fontName = fileName,
+                            customFontPath = fontFile.absolutePath
+                        )
+                        state.copy(
+                            loadedFontFamily = fontFamily,
+                            customFontName = fileName,
+                            subtitleStyle = updatedStyle,
+                            generatedAssContent = generateAssString(state.subtitles, updatedStyle, state.subtitleFileName),
+                            isLoading = false,
+                            statusMessage = "Özel font yüklendi: $fileName"
+                        )
+                    }
+                } else {
+                    _uiState.update {
+                        it.copy(
+                            isLoading = false,
+                            statusMessage = "Font dosyası ayrıştırılamadı (.ttf olduğundan emin olun)"
+                        )
+                    }
+                }
+            } else {
+                _uiState.update {
+                    it.copy(
+                        isLoading = false,
+                        statusMessage = "Font kopyalama hatası!"
+                    )
+                }
+            }
+        }
+    }
+
+    fun selectPresetFont(name: String, family: FontFamily?) {
+        _uiState.update { state ->
+            val updatedStyle = state.subtitleStyle.copy(
+                fontName = name,
+                customFontPath = null
+            )
+            state.copy(
+                loadedFontFamily = family,
+                customFontName = null,
+                subtitleStyle = updatedStyle,
+                generatedAssContent = generateAssString(state.subtitles, updatedStyle, state.subtitleFileName),
+                statusMessage = "Font değiştirildi: $name"
+            )
+        }
+    }
+
+    fun updatePlaybackPosition(posMs: Long) {
+        _uiState.update { it.copy(currentPositionMs = posMs) }
+        updateActiveCues(posMs)
+    }
+
+    fun updateDuration(durationMs: Long) {
+        _uiState.update { it.copy(durationMs = durationMs) }
+    }
+
+    fun setIsPlaying(playing: Boolean) {
+        _uiState.update { it.copy(isPlaying = playing) }
+    }
+
+    fun seekTo(positionMs: Long) {
+        val target = positionMs.coerceIn(0L, _uiState.value.durationMs.coerceAtLeast(0L))
+        _seekEvent.tryEmit(target)
+        updatePlaybackPosition(target)
+    }
+
+    fun navigateToEditor() {
+        _uiState.update { it.copy(currentScreen = AppScreen.EDITOR) }
+    }
+
+    fun navigateToMainMenu() {
+        _uiState.update { it.copy(currentScreen = AppScreen.MAIN_MENU) }
+    }
+
+    fun startBlankProject() {
+        _uiState.update {
+            it.copy(
+                subtitles = emptyList(),
+                subtitleFileName = "yeni_proje.ass",
+                generatedAssContent = "",
+                wasConvertedFromSrt = false,
+                currentScreen = AppScreen.EDITOR,
+                statusMessage = "Yeni boş altyazı projesi oluşturuldu"
+            )
+        }
+    }
+
+    fun setPlaybackSpeed(speed: Float) {
+        _uiState.update {
+            it.copy(
+                playbackSpeed = speed,
+                statusMessage = "Oynatma hızı: ${speed}x"
+            )
+        }
+    }
+
+    fun setSelectedTab(tab: Int) {
+        _uiState.update { it.copy(selectedTab = tab) }
+    }
+
+    fun setSearchQuery(query: String) {
+        _uiState.update { it.copy(searchQuery = query) }
+    }
+
+    fun toggleFullscreen() {
+        _uiState.update { it.copy(isFullscreen = !it.isFullscreen) }
+    }
+
+    fun updateStyle(update: (SubtitleStyle) -> SubtitleStyle) {
+        _uiState.update { state ->
+            val newStyle = update(state.subtitleStyle)
+            state.copy(
+                subtitleStyle = newStyle,
+                generatedAssContent = generateAssString(state.subtitles, newStyle, state.subtitleFileName)
+            )
+        }
+        updateActiveCues(_uiState.value.currentPositionMs)
+    }
+
+    fun adjustTimeOffset(deltaMs: Long) {
+        _uiState.update { state ->
+            val newOffset = state.subtitleStyle.timeOffsetMs + deltaMs
+            val newStyle = state.subtitleStyle.copy(timeOffsetMs = newOffset)
+            state.copy(
+                subtitleStyle = newStyle,
+                generatedAssContent = generateAssString(state.subtitles, newStyle, state.subtitleFileName),
+                statusMessage = "Senkron kayması: ${if (newOffset >= 0) "+$newOffset" else "$newOffset"} ms"
+            )
+        }
+        updateActiveCues(_uiState.value.currentPositionMs)
+    }
+
+    fun resetTimeOffset() {
+        _uiState.update { state ->
+            val newStyle = state.subtitleStyle.copy(timeOffsetMs = 0L)
+            state.copy(
+                subtitleStyle = newStyle,
+                generatedAssContent = generateAssString(state.subtitles, newStyle, state.subtitleFileName),
+                statusMessage = "Senkron sıfırlandı (0 ms)"
+            )
+        }
+        updateActiveCues(_uiState.value.currentPositionMs)
+    }
+
+    fun startEditingCue(cue: SubtitleCue) {
+        _uiState.update { it.copy(editingCue = cue) }
+    }
+
+    fun dismissEditingCue() {
+        _uiState.update { it.copy(editingCue = null) }
+    }
+
+    fun saveEditedCue(updatedCue: SubtitleCue) {
+        pushUndoState(_uiState.value.subtitles)
+        _uiState.update { state ->
+            val updatedList = state.subtitles.map { if (it.id == updatedCue.id) updatedCue else it }
+                .sortedBy { it.startTimeMs }
+            state.copy(
+                subtitles = updatedList,
+                editingCue = null,
+                selectedCueId = updatedCue.id,
+                generatedAssContent = generateAssString(updatedList, state.subtitleStyle, state.subtitleFileName),
+                statusMessage = "Altyazı #${updatedCue.id} güncellendi"
+            )
+        }
+        updateActiveCues(_uiState.value.currentPositionMs)
+    }
+
+    private var dragInitialCues: List<SubtitleCue>? = null
+
+    fun updateCuePositionFromDrag(cueId: Int, newAssX: Float, newAssY: Float) {
+        if (dragInitialCues == null) {
+            dragInitialCues = _uiState.value.subtitles
+        }
+        val currentCues = _uiState.value.subtitles
+        val updatedCues = currentCues.map { cue ->
+            if (cue.id == cueId) {
+                val newRawText = com.example.parser.AssTagManager.updatePos(cue.rawText, newAssX, newAssY)
+                val newClean = com.example.parser.HtmlSubtitleParser.cleanToPlainText(newRawText)
+                cue.copy(rawText = newRawText, cleanText = newClean)
+            } else cue
+        }
+        _uiState.update { state ->
+            state.copy(
+                subtitles = updatedCues,
+                selectedCueId = cueId
+            )
+        }
+        updateActiveCues(_uiState.value.currentPositionMs)
+    }
+
+    fun commitCueDrag(cueId: Int) {
+        val initial = dragInitialCues
+        dragInitialCues = null
+        if (initial != null) {
+            pushUndoState(initial)
+            val current = _uiState.value.subtitles
+            _uiState.update { state ->
+                state.copy(
+                    generatedAssContent = generateAssString(current, state.subtitleStyle, state.subtitleFileName),
+                    statusMessage = "Altyazı konumu güncellendi (\\pos)"
+                )
+            }
+        }
+    }
+
+    fun updateCueAssTag(cueId: Int, tagKey: String, tagValue: String?) {
+        val current = _uiState.value.subtitles
+        pushUndoState(current)
+        val updated = current.map { cue ->
+            if (cue.id == cueId) {
+                val newRawText = com.example.parser.AssTagManager.updateTag(cue.rawText, tagKey, tagValue)
+                val newClean = com.example.parser.HtmlSubtitleParser.cleanToPlainText(newRawText)
+                cue.copy(rawText = newRawText, cleanText = newClean)
+            } else cue
+        }
+        _uiState.update { state ->
+            state.copy(
+                subtitles = updated,
+                selectedCueId = cueId,
+                generatedAssContent = generateAssString(updated, state.subtitleStyle, state.subtitleFileName),
+                statusMessage = "ASS override tag güncellendi: \\$tagKey"
+            )
+        }
+        updateActiveCues(_uiState.value.currentPositionMs)
+    }
+
+    fun applyBatchTagsToAllCues(tagsToApply: Map<String, String?>) {
+        val current = _uiState.value.subtitles
+        if (current.isEmpty() || tagsToApply.isEmpty()) return
+        pushUndoState(current)
+        val updated = com.example.parser.AssTagManager.applyBatchTags(current, tagsToApply)
+        _uiState.update { state ->
+            state.copy(
+                subtitles = updated,
+                generatedAssContent = generateAssString(updated, state.subtitleStyle, state.subtitleFileName),
+                statusMessage = "${updated.size} altyazıya toplu ASS tag uygulandı."
+            )
+        }
+        updateActiveCues(_uiState.value.currentPositionMs)
+    }
+
+    fun openEncodeTasksDialog() {
+        _uiState.update { it.copy(showEncodeTasksDialog = true) }
+    }
+
+    fun dismissEncodeTasksDialog() {
+        _uiState.update { it.copy(showEncodeTasksDialog = false) }
+    }
+
+    fun openBatchTagDialog() {
+        _uiState.update { it.copy(showBatchTagDialog = true) }
+    }
+
+    fun dismissBatchTagDialog() {
+        _uiState.update { it.copy(showBatchTagDialog = false) }
+    }
+
+    fun addNewCueAtCurrentPosition() {
+        val currentPos = _uiState.value.currentPositionMs
+        pushUndoState(_uiState.value.subtitles)
+        val nextId = (_uiState.value.subtitles.maxOfOrNull { it.id } ?: 0) + 1
+        val newCue = SubtitleCue(
+            id = nextId,
+            startTimeMs = currentPos,
+            endTimeMs = currentPos + 3000L,
+            rawText = "Yeni Altyazı Satırı",
+            cleanText = "Yeni Altyazı Satırı"
+        )
+        _uiState.update { state ->
+            val updated = (state.subtitles + newCue).sortedBy { it.startTimeMs }
+            state.copy(
+                subtitles = updated,
+                editingCue = null,
+                selectedCueId = newCue.id,
+                generatedAssContent = generateAssString(updated, state.subtitleStyle, state.subtitleFileName),
+                statusMessage = "Yeni altyazı eklendi (#$nextId)"
+            )
+        }
+        updateActiveCues(currentPos)
+    }
+
+    fun deleteCue(cueId: Int) {
+        pushUndoState(_uiState.value.subtitles)
+        _uiState.update { state ->
+            val updated = state.subtitles.filterNot { it.id == cueId }
+            state.copy(
+                subtitles = updated,
+                editingCue = null,
+                selectedCueId = if (state.selectedCueId == cueId) null else state.selectedCueId,
+                generatedAssContent = generateAssString(updated, state.subtitleStyle, state.subtitleFileName),
+                statusMessage = "Altyazı #$cueId silindi"
+            )
+        }
+        updateActiveCues(_uiState.value.currentPositionMs)
+    }
+
+    fun openExportDialog() {
+        val currentAss = generateAssString(_uiState.value.subtitles, _uiState.value.subtitleStyle, _uiState.value.subtitleFileName)
+        _uiState.update {
+            it.copy(
+                generatedAssContent = currentAss,
+                showExportDialog = true
+            )
+        }
+    }
+
+    fun dismissExportDialog() {
+        _uiState.update { it.copy(showExportDialog = false) }
+    }
+
+    val encodeState: StateFlow<com.example.encode.EncodeState> = com.example.encode.HardsubEncoder.encodeState
+
+    fun openEncodeDialog() {
+        try {
+            if (_uiState.value.videoUri == null) {
+                // Load demo video if none selected so user has an immediate video ready to encode
+                loadDemoMedia()
+            } else {
+                extractVideoMetadata(_uiState.value.videoUri)
+            }
+            com.example.encode.HardsubEncoder.resetState()
+            _uiState.update { it.copy(showEncodeDialog = true, errorMessage = null) }
+        } catch (t: Throwable) {
+            android.util.Log.e("AxiSubViewModel", "Error opening encode dialog", t)
+            _uiState.update {
+                it.copy(
+                    showEncodeDialog = true,
+                    errorMessage = "Encode modülü hazırlanırken hata: ${t.localizedMessage ?: t.javaClass.simpleName}"
+                )
+            }
+        }
+    }
+
+    fun dismissEncodeDialog() {
+        if (!encodeState.value.isEncoding && !encodeState.value.isPreparing) {
+            _uiState.update { it.copy(showEncodeDialog = false) }
+        }
+    }
+
+    fun updateEncodingSettings(settings: com.example.encode.EncodingSettings) {
+        _uiState.update { it.copy(encodingSettings = settings) }
+    }
+
+    fun openCompatibilityTest() {
+        _uiState.update { it.copy(showCompatibilityDialog = true) }
+        if (_uiState.value.compatibilityTestResults.isEmpty()) {
+            runCompatibilityTest()
+        }
+    }
+
+    fun dismissCompatibilityTest() {
+        _uiState.update { it.copy(showCompatibilityDialog = false) }
+    }
+
+    fun runCompatibilityTest() {
+        viewModelScope.launch(Dispatchers.IO) {
+            _uiState.update { it.copy(isCompatibilityTestRunning = true) }
+            val results = com.example.encode.DeviceCodecDetector.runCompatibilityTestSuite(getApplication())
+            _uiState.update {
+                it.copy(
+                    isCompatibilityTestRunning = false,
+                    compatibilityTestResults = results
+                )
+            }
+        }
+    }
+
+    fun startMagnetDownload(magnetUri: String) {
+        com.example.torrent.TorrentDownloadManager.startMagnetDownload(getApplication(), magnetUri)
+    }
+
+    fun startTorrentFileDownload(torrentUri: Uri) {
+        com.example.torrent.TorrentDownloadManager.startTorrentFileDownload(getApplication(), torrentUri)
+    }
+
+    fun pauseTorrentDownload() {
+        com.example.torrent.TorrentDownloadManager.pauseDownload()
+    }
+
+    fun resumeTorrentDownload() {
+        com.example.torrent.TorrentDownloadManager.resumeDownload(getApplication())
+    }
+
+    fun cancelTorrentDownload() {
+        com.example.torrent.TorrentDownloadManager.cancelDownload()
+    }
+
+    fun retryTorrentDownload() {
+        com.example.torrent.TorrentDownloadManager.retryLastDownload(getApplication())
+    }
+
+    fun saveTorrentDownloadToGallery() {
+        com.example.torrent.TorrentDownloadManager.saveDownloadedVideoToGallery(getApplication())
+    }
+
+    fun selectTorrentVideoFile(fileName: String) {
+        com.example.torrent.TorrentDownloadManager.selectVideoFile(fileName)
+    }
+
+    fun openDownloadedVideoInEditor(file: File) {
+        // The download stays in app storage, so the editor reads the file directly
+        loadLocalVideo(Uri.fromFile(file))
+        navigateToEditor()
+        _uiState.update {
+            it.copy(
+                isHardsubVideoPlaying = false,
+                statusMessage = "İndirilen torrent videosu düzenleyiciye aktarıldı!"
+            )
+        }
+    }
+
+    fun openAnimeSearch() {
+        _uiState.update { it.copy(currentScreen = AppScreen.ANIME_SEARCH) }
+    }
+
+    fun updateAnimeSearchQuery(query: String) {
+        _animeSearchState.update { it.copy(query = query) }
+    }
+
+    fun selectAnimeSource(source: AnimeSource) {
+        if (_animeSearchState.value.source == source) return
+        _animeSearchState.update { it.copy(source = source, results = emptyList(), errorMessage = null) }
+        if (_animeSearchState.value.lastSearchedQuery != null) runAnimeSearch()
+    }
+
+    fun selectAnimeQuality(quality: VideoQuality) {
+        if (_animeSearchState.value.quality == quality) return
+        _animeSearchState.update { it.copy(quality = quality) }
+        if (_animeSearchState.value.lastSearchedQuery != null) runAnimeSearch()
+    }
+
+    fun toggleAnimeSortBySeeders() {
+        _animeSearchState.update { it.copy(sortBySeeders = !it.sortBySeeders) }
+    }
+
+    fun runAnimeSearch() {
+        val state = _animeSearchState.value
+        val query = state.query.trim()
+        if (query.length < 2) {
+            _animeSearchState.update { it.copy(errorMessage = "Aramak için en az 2 harf yaz.") }
+            return
+        }
+        animeSearchJob?.cancel()
+        _animeSearchState.update { it.copy(isLoading = true, errorMessage = null) }
+        animeSearchJob = viewModelScope.launch {
+            try {
+                val results = AnimeSearchRepository.search(query, state.source, state.quality)
+                _animeSearchState.update {
+                    it.copy(isLoading = false, results = results, lastSearchedQuery = query, errorMessage = null)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: AnimeSearchException) {
+                _animeSearchState.update {
+                    it.copy(isLoading = false, results = emptyList(), lastSearchedQuery = query, errorMessage = e.message)
+                }
+            } catch (t: Throwable) {
+                android.util.Log.e("AxiSubViewModel", "Anime search failed", t)
+                _animeSearchState.update {
+                    it.copy(
+                        isLoading = false,
+                        results = emptyList(),
+                        lastSearchedQuery = query,
+                        errorMessage = "Arama başarısız: ${t.localizedMessage ?: t.javaClass.simpleName}"
+                    )
+                }
+            }
+        }
+    }
+
+    fun downloadAnimeSearchResult(result: AnimeSearchResult) {
+        com.example.torrent.TorrentDownloadManager.startMagnetDownload(
+            context = getApplication(),
+            magnetUri = result.magnetUri,
+            displayName = result.title,
+            sourceLabel = result.source.displayName
+        )
+        _uiState.update {
+            it.copy(
+                currentScreen = AppScreen.MAIN_MENU,
+                statusMessage = "İndirme başlatıldı: ${result.title}"
+            )
+        }
+    }
+
+    /** Checks GitHub for a newer build and downloads it in the background (on any network). */
+    fun checkForUpdates() {
+        if (!AppUpdater.isConfigured || updateJob?.isActive == true) return
+        updateJob = viewModelScope.launch {
+            val context = getApplication<Application>()
+            _updateState.value = UpdateState.Checking
+            val info = try {
+                AppUpdater.cleanup(context)
+                AppUpdater.fetchLatest()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                // Offline or GitHub unreachable: stay quiet and try again on the next launch
+                android.util.Log.w("AxiSubViewModel", "Update check failed: ${t.message}")
+                _updateState.value = UpdateState.Idle
+                return@launch
+            }
+            if (info.versionCode <= AppUpdater.currentVersionCode(context)) {
+                _updateState.value = UpdateState.Idle
+                return@launch
+            }
+            _updateState.value = UpdateState.Downloading(info, 0f)
+            try {
+                val apk = AppUpdater.download(context, info) { progress ->
+                    _updateState.value = UpdateState.Downloading(info, progress)
+                }
+                _updateState.value = UpdateState.ReadyToInstall(info, apk)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                android.util.Log.w("AxiSubViewModel", "Update download failed", t)
+                _updateState.value = UpdateState.Failed(info, t.message ?: "Güncelleme indirilemedi.")
+            }
+        }
+    }
+
+    fun startHardsubEncode() {
+        val state = _uiState.value
+        val videoUri = state.videoUri ?: run {
+            _uiState.update { it.copy(errorMessage = "Lütfen önce bir video seçin veya örnek videoyu yükleyin.") }
+            return
+        }
+        if (state.subtitles.isEmpty()) {
+            _uiState.update { it.copy(errorMessage = "Lütfen önce bir altyazı dosyası (.ass/.srt) yükleyin.") }
+            return
+        }
+        val videoWidth = if (state.sourceVideoMetadata.width > 0) state.sourceVideoMetadata.width else 1920
+        val videoHeight = if (state.sourceVideoMetadata.height > 0) state.sourceVideoMetadata.height else 1080
+        val additionalStyles = if (state.additionalStyles.isNotEmpty()) {
+            state.additionalStyles
+        } else {
+            SubtitleParser.extractAssStyles(state.generatedAssContent)
+        }
+
+        val assContent = AssGenerator.generateAss(
+            title = state.subtitleFileName?.ifBlank { "remsubs_hardsub" } ?: "remsubs_hardsub",
+            subtitles = state.subtitles,
+            style = state.subtitleStyle,
+            applyTimeOffset = false,
+            videoWidth = videoWidth,
+            videoHeight = videoHeight,
+            additionalStyles = additionalStyles
+        )
+        val videoFileName = FontManager.getFileName(getApplication(), videoUri) ?: "video.mp4"
+
+        EncodeQueueManager.enqueueTask(
+            context = getApplication(),
+            videoUri = videoUri,
+            videoFileName = videoFileName,
+            assContent = assContent,
+            introVideoUri = state.introVideoUri,
+            introDurationMs = state.introVideoDurationMs,
+            introKeepAudio = state.introKeepAudio,
+            settings = state.encodingSettings
+        )
+
+        val hasNotificationPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ContextCompat.checkSelfPermission(getApplication(), Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+        } else {
+            NotificationManagerCompat.from(getApplication()).areNotificationsEnabled()
+        }
+
+        val statusMsg = if (hasNotificationPermission) {
+            "Encode kuyruğa eklendi. Bildirimden ve Görevler ekranından anlık takip edebilirsiniz."
+        } else {
+            "Encode kuyruğa eklendi. Bildirim izni kapalı olduğu için ilerlemeyi Görevler ekranından ve ana menü şeridinden takip edebilirsiniz."
+        }
+
+        _uiState.update {
+            it.copy(
+                showEncodeDialog = false,
+                showEncodeTasksDialog = true,
+                statusMessage = statusMsg
+            )
+        }
+    }
+
+    fun setIntroVideo(uri: Uri) {
+        val context = getApplication<Application>()
+        val title = FontManager.getFileName(context, uri) ?: "İntro Video"
+        val retriever = android.media.MediaMetadataRetriever()
+        var dur = 0L
+        var w = 0
+        var h = 0
+        var fps = 30.0
+        try {
+            retriever.setDataSource(context, uri)
+            dur = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+            w = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
+            h = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
+            val fpsStr = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+                retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)
+            } else null
+            fps = fpsStr?.toDoubleOrNull() ?: 30.0
+        } catch (_: Exception) {}
+        finally {
+            try { retriever.release() } catch (_: Exception) {}
+        }
+        _uiState.update {
+            it.copy(
+                introVideoUri = uri,
+                introVideoTitle = title,
+                introVideoDurationMs = dur,
+                introVideoWidth = w,
+                introVideoHeight = h,
+                introVideoFps = fps,
+                statusMessage = "İntro video eklendi: $title (${String.format(java.util.Locale.US, "%.1f sn", dur / 1000f)})"
+            )
+        }
+    }
+
+    fun removeIntroVideo() {
+        _uiState.update {
+            it.copy(
+                introVideoUri = null,
+                introVideoTitle = null,
+                introVideoDurationMs = 0L,
+                introVideoWidth = 0,
+                introVideoHeight = 0,
+                showIntroPreview = false,
+                statusMessage = "İntro video kaldırıldı."
+            )
+        }
+    }
+
+    fun setIntroKeepAudio(keep: Boolean) {
+        _uiState.update { it.copy(introKeepAudio = keep) }
+    }
+
+    fun setShowIntroPreview(show: Boolean) {
+        _uiState.update { it.copy(showIntroPreview = show) }
+    }
+
+    fun inspectMkvForSoftsubs(uri: Uri) {
+        viewModelScope.launch {
+            val context = getApplication<Application>()
+            val fileName = FontManager.getFileName(context, uri) ?: "video.mkv"
+            _uiState.update {
+                it.copy(
+                    showMkvExtractionDialog = true,
+                    isInspectingMkv = true,
+                    isExtractingMkvSubtitle = false,
+                    mkvFileName = fileName,
+                    mkvFileReference = null,
+                    mkvSubtitleTracks = emptyList(),
+                    selectedMkvTrack = null,
+                    extractedSubtitleFile = null,
+                    mkvExtractionErrorMessage = null
+                )
+            }
+
+            when (val result = com.example.mkv.MkvSubtitleExtractor.inspectMkv(context, uri)) {
+                is com.example.mkv.MkvInspectionResult.Success -> {
+                    val defaultTrack = result.tracks.firstOrNull { it.isDefault } ?: result.tracks.firstOrNull()
+                    _uiState.update {
+                        it.copy(
+                            isInspectingMkv = false,
+                            mkvFileReference = result.mkvFile,
+                            mkvSubtitleTracks = result.tracks,
+                            selectedMkvTrack = defaultTrack
+                        )
+                    }
+                }
+                is com.example.mkv.MkvInspectionResult.NoSubtitlesFound -> {
+                    _uiState.update {
+                        it.copy(
+                            isInspectingMkv = false,
+                            mkvSubtitleTracks = emptyList(),
+                            mkvExtractionErrorMessage = null
+                        )
+                    }
+                }
+                is com.example.mkv.MkvInspectionResult.Error -> {
+                    _uiState.update {
+                        it.copy(
+                            isInspectingMkv = false,
+                            mkvExtractionErrorMessage = result.message
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    fun selectMkvTrack(track: com.example.mkv.MkvSubtitleTrack) {
+        _uiState.update { it.copy(selectedMkvTrack = track) }
+    }
+
+    fun extractSelectedMkvSubtitle() {
+        val state = _uiState.value
+        val mkvFile = state.mkvFileReference ?: run {
+            _uiState.update { it.copy(mkvExtractionErrorMessage = "MKV dosyası bulunamadı.") }
+            return
+        }
+        val track = state.selectedMkvTrack ?: run {
+            _uiState.update { it.copy(mkvExtractionErrorMessage = "Lütfen bir altyazı parçası seçin.") }
+            return
+        }
+
+        viewModelScope.launch {
+            _uiState.update {
+                it.copy(
+                    isExtractingMkvSubtitle = true,
+                    mkvExtractionErrorMessage = null
+                )
+            }
+            val context = getApplication<Application>()
+            when (val result = com.example.mkv.MkvSubtitleExtractor.extractTrack(context, mkvFile, track)) {
+                is com.example.mkv.SubtitleExtractionResult.Success -> {
+                    _uiState.update {
+                        it.copy(
+                            isExtractingMkvSubtitle = false,
+                            extractedSubtitleFile = result.extractedFile,
+                            statusMessage = "Altyazı başarıyla ayıklandı: ${result.extractedFile.name}"
+                        )
+                    }
+                }
+                is com.example.mkv.SubtitleExtractionResult.Error -> {
+                    _uiState.update {
+                        it.copy(
+                            isExtractingMkvSubtitle = false,
+                            mkvExtractionErrorMessage = result.message
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    fun dismissMkvExtractionDialog() {
+        _uiState.update {
+            it.copy(
+                showMkvExtractionDialog = false,
+                isInspectingMkv = false,
+                isExtractingMkvSubtitle = false,
+                mkvExtractionErrorMessage = null
+            )
+        }
+    }
+
+    fun openExtractedSubtitleInEditor(file: File) {
+        val uri = Uri.fromFile(file)
+        loadSubtitleFromUri(uri)
+        val mkvFile = _uiState.value.mkvFileReference
+        if (mkvFile != null && mkvFile.exists()) {
+            val videoUri = Uri.fromFile(mkvFile)
+            loadLocalVideo(videoUri)
+        }
+        navigateToEditor()
+        _uiState.update {
+            it.copy(
+                showMkvExtractionDialog = false,
+                statusMessage = "Ayıklanan altyazı (${file.name}) editöre yüklendi!"
+            )
+        }
+    }
+
+    fun cancelHardsubEncode() {
+        com.example.encode.HardsubEncoder.cancelEncoding(getApplication())
+    }
+
+    fun playEncodedVideo(file: File) {
+        val uri = Uri.fromFile(file)
+        _uiState.update {
+            it.copy(
+                videoUri = uri,
+                videoTitle = "Hardsub Video (${file.name})",
+                showEncodeDialog = false,
+                isHardsubVideoPlaying = true,
+                statusMessage = "Hardsub gömülü video oynatıcıya yüklendi!"
+            )
+        }
+    }
+
+    fun saveExportedAssToUri(uri: Uri, onResult: (Boolean, String) -> Unit) {
+        viewModelScope.launch {
+            try {
+                val context = getApplication<Application>()
+                val content = _uiState.value.generatedAssContent.ifBlank {
+                    generateAssString(_uiState.value.subtitles, _uiState.value.subtitleStyle, _uiState.value.subtitleFileName)
+                }
+                context.contentResolver.openOutputStream(uri)?.use { os ->
+                    os.write(content.toByteArray(Charsets.UTF_8))
+                    os.flush()
+                }
+                _uiState.update {
+                    it.copy(
+                        statusMessage = "Düzenlenmiş .ASS dosyası başarıyla kaydedildi!",
+                        showExportDialog = false
+                    )
+                }
+                onResult(true, "Kaydedildi")
+            } catch (e: Exception) {
+                e.printStackTrace()
+                _uiState.update {
+                    it.copy(statusMessage = "Kaydetme hatası: ${e.localizedMessage}")
+                }
+                onResult(false, e.localizedMessage ?: "Bilinmeyen hata")
+            }
+        }
+    }
+
+    fun setErrorMessage(message: String?) {
+        _uiState.update { it.copy(errorMessage = message, isLoading = false) }
+    }
+
+    fun clearStatusMessage() {
+        _uiState.update { it.copy(statusMessage = null) }
+    }
+
+    private fun updateActiveCues(currentPos: Long) {
+        val offset = _uiState.value.subtitleStyle.timeOffsetMs
+        val effectiveTime = currentPos - offset
+        val active = _uiState.value.subtitles.filter { cue ->
+            effectiveTime in cue.startTimeMs..cue.endTimeMs
+        }
+        _uiState.update { it.copy(activeCues = active) }
+    }
+}

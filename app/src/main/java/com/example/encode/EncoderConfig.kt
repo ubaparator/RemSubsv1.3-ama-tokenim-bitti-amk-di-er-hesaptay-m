@@ -1,0 +1,253 @@
+package com.example.encode
+
+import java.io.File
+
+/**
+ * State representing current hardsub encoding phase, progress, and output.
+ */
+data class EncodeState(
+    val isPreparing: Boolean = false,
+    val isEncoding: Boolean = false,
+    val isCompleted: Boolean = false,
+    val isCancelled: Boolean = false,
+    val currentPhaseText: String = "Hazır",
+    val currentEncoderName: String = "libx264 (Dahili FFmpeg)",
+    val progress: Float = 0f, // 0.0 to 1.0
+    val progressPercentage: Int = 0, // 0 to 100
+    val currentFrame: Long = 0L,
+    val totalFrames: Long = 0L,
+    val currentFps: Double = 0.0,
+    val fpsToTotalFramesRatio: Double = 0.0,
+    val estimatedRemainingSeconds: Long = 0L,
+    val averageEstimatedFinishText: String = "--:--",
+    val elapsedSeconds: Long = 0L,
+    val outputVideoFile: File? = null,
+    val errorMessage: String? = null,
+    val lastLogLine: String = "",
+    val fullLogs: String = "",
+    val sourceMetadata: SourceVideoMetadata = SourceVideoMetadata()
+)
+
+/**
+ * Supported video encoder types.
+ * Hardware encoders (MediaCodec) use target bitrates; software encoders (libx264/libx265) use CRF & presets.
+ */
+enum class EncoderOption(
+    val id: String,
+    val displayName: String,
+    val ffmpegName: String,
+    val isHardware: Boolean,
+    val supportsCrf: Boolean,
+    val supportsPreset: Boolean,
+    val defaultBitrate: String = "4000k"
+) {
+    AUTO(
+        id = "auto",
+        displayName = "AUTO",
+        ffmpegName = "auto",
+        isHardware = false,
+        supportsCrf = true,
+        supportsPreset = true
+    ),
+    LIBX264(
+        id = "libx264",
+        displayName = "Software H.264",
+        ffmpegName = "libx264",
+        isHardware = false,
+        supportsCrf = true,
+        supportsPreset = true
+    ),
+    MEDIA_CODEC_H264(
+        id = "h264_mediacodec",
+        displayName = "Hardware H.264",
+        ffmpegName = "h264_mediacodec",
+        isHardware = true,
+        supportsCrf = false,
+        supportsPreset = false,
+        defaultBitrate = "4500k"
+    ),
+    MEDIA_CODEC_H265(
+        id = "hevc_mediacodec",
+        displayName = "Hardware HEVC",
+        ffmpegName = "hevc_mediacodec",
+        isHardware = true,
+        supportsCrf = false,
+        supportsPreset = false,
+        defaultBitrate = "3200k"
+    ),
+    LIBX265(
+        id = "libx265",
+        displayName = "Software HEVC (libx265)",
+        ffmpegName = "libx265",
+        isHardware = false,
+        supportsCrf = true,
+        supportsPreset = true
+    ),
+    VP9(
+        id = "vp9",
+        displayName = "VP9 (Google)",
+        ffmpegName = "libvpx-vp9",
+        isHardware = false,
+        supportsCrf = true,
+        supportsPreset = false,
+        defaultBitrate = "3000k"
+    ),
+    AV1(
+        id = "av1",
+        displayName = "AV1 (AOMedia)",
+        ffmpegName = "libaom-av1",
+        isHardware = false,
+        supportsCrf = true,
+        supportsPreset = false,
+        defaultBitrate = "2500k"
+    )
+}
+
+/**
+ * Pre-configured Quality presets mapping to optimal Resolution, CRF, Bitrate & Audio trade-offs.
+ */
+enum class QualityOption(
+    val id: String,
+    val displayName: String,
+    val resolution: String,
+    val defaultCrf: Int,
+    val defaultPreset: String,
+    val defaultBitrate: String,
+    val defaultAudioOption: String,
+    val description: String
+) {
+    ULTRA_1080P(
+        id = "ultra_1080p",
+        displayName = "1080p Ultra",
+        resolution = "1080p",
+        defaultCrf = 16,
+        defaultPreset = "slow",
+        defaultBitrate = "8000k",
+        defaultAudioOption = "AAC 320 kbps (Yüksek)",
+        description = "Maksimum görsel keskinlik & stüdyo ses kalitesi"
+    ),
+    HIGH_1080P(
+        id = "high_1080p",
+        displayName = "1080p Yüksek (Önerilen)",
+        resolution = "1080p",
+        defaultCrf = 18,
+        defaultPreset = "medium",
+        defaultBitrate = "5000k",
+        defaultAudioOption = "AAC 192 kbps (Standart)",
+        description = "En ideal görsel kalite ve dosya boyutu dengesi"
+    ),
+    STANDARD_720P(
+        id = "standard_720p",
+        displayName = "720p Standart",
+        resolution = "720p",
+        defaultCrf = 20,
+        defaultPreset = "medium",
+        defaultBitrate = "3200k",
+        defaultAudioOption = "AAC 192 kbps (Standart)",
+        description = "Mobil cihazlar ve sosyal medya için ideal"
+    ),
+    FAST_720P(
+        id = "fast_720p",
+        displayName = "720p Hızlı",
+        resolution = "720p",
+        defaultCrf = 23,
+        defaultPreset = "veryfast",
+        defaultBitrate = "2200k",
+        defaultAudioOption = "AAC 128 kbps (Kompakt)",
+        description = "Yüksek hızda hızlı render ve akıcı video"
+    ),
+    COMPACT_480P(
+        id = "compact_480p",
+        displayName = "480p Kompakt",
+        resolution = "480p",
+        defaultCrf = 25,
+        defaultPreset = "veryfast",
+        defaultBitrate = "1200k",
+        defaultAudioOption = "AAC 128 kbps (Kompakt)",
+        description = "Küçük dosya boyutu, minimum depolama"
+    ),
+    SOURCE_ORIGINAL(
+        id = "source_original",
+        displayName = "Orijinal Kalite (Önerilen)",
+        resolution = "Kaynakla Aynı",
+        defaultCrf = 18,
+        defaultPreset = "veryfast",
+        defaultBitrate = "Otomatik",
+        defaultAudioOption = "Orijinal (Mümkünse Copy)",
+        description = "Videonun orijinal çözünürlük, FPS ve ses akışını korur"
+    ),
+    CUSTOM(
+        id = "custom",
+        displayName = "Özel Ayarlar",
+        resolution = "Kaynakla Aynı",
+        defaultCrf = 18,
+        defaultPreset = "veryfast",
+        defaultBitrate = "Otomatik",
+        defaultAudioOption = "Orijinal (Mümkünse Copy)",
+        description = "Çözünürlük, CRF, FPS ve ses parametrelerini elle belirleyin"
+    )
+}
+
+/**
+ * User-selected or detected encoding settings.
+ */
+data class EncodingSettings(
+    val qualityOption: QualityOption = QualityOption.SOURCE_ORIGINAL,
+    val resolution: String = "Kaynakla Aynı", // "Kaynakla Aynı", "1080p", "720p", "480p", "360p"
+    val encoderOption: EncoderOption = EncoderOption.AUTO,
+    val videoCodec: String = "Otomatik", // "Otomatik", "libx264", "libx265", "h264_mediacodec", "hevc_mediacodec"
+    val crf: Int = 18, // 14 to 28
+    val preset: String = "veryfast", // ultrafast, superfast, veryfast, faster, fast, medium, slow, veryslow
+    val bitrate: String = "Otomatik", // "Otomatik", "1500k", "2500k", "4000k", "6000k", "8000k", "12000k"
+    val fps: String = "Kaynakla Aynı", // "Kaynakla Aynı", "24", "30", "60"
+    val audioOption: String = "Orijinal (Mümkünse Copy)", // "Orijinal (Mümkünse Copy)", "AAC 320 kbps (Yüksek)", "AAC 192 kbps (Standart)", "AAC 128 kbps (Kompakt)", "Sessiz / Ses Yok"
+    val pixelFormat: String = "yuv420p", // "yuv420p", "nv12", "Otomatik"
+    val hardwareAcceleration: String = "Otomatik" // "Otomatik", "Zorunlu Açık", "Kapalı"
+)
+
+/**
+ * Metadata extracted from input video.
+ */
+data class SourceVideoMetadata(
+    val codec: String = "Bilinmiyor",
+    val resolution: String = "Bilinmiyor",
+    val width: Int = 0,
+    val height: Int = 0,
+    val fps: Double = 30.0,
+    val bitrateKbps: Long = 0L,
+    val durationMs: Long = 0L,
+    val audioCodec: String = "AAC",
+    val pixelFormat: String = "yuv420p",
+    val isHdr: Boolean = false
+) {
+    fun toDisplayLines(): List<Pair<String, String>> {
+        val list = mutableListOf<Pair<String, String>>()
+        list.add("Codec" to codec)
+        list.add("Çözünürlük" to if (width > 0 && height > 0) "${width}x${height}" else resolution)
+        list.add("FPS" to String.format(java.util.Locale.US, "%.1f", fps))
+        list.add("Ses" to audioCodec)
+        if (bitrateKbps > 0) {
+            list.add("Bitrate" to "${bitrateKbps} kbps")
+        }
+        if (durationMs > 0) {
+            val totalSec = durationMs / 1000
+            val min = totalSec / 60
+            val sec = totalSec % 60
+            list.add("Süre" to String.format(java.util.Locale.US, "%02d:%02d", min, sec))
+        }
+        if (isHdr) {
+            list.add("HDR/SDR" to "HDR Destekli")
+        }
+        return list
+    }
+}
+
+/**
+ * Result of individual compatibility check during "Uyumluluk Testi".
+ */
+data class CompatibilityTestItem(
+    val title: String,
+    val statusText: String,
+    val isOk: Boolean,
+    val details: String = ""
+)
