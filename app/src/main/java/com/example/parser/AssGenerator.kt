@@ -165,6 +165,72 @@ object AssGenerator {
         return sb.toString()
     }
 
+    /**
+     * Rebuilds an ASS script by preserving the entire original structure:
+     * - [Script Info] (Title, PlayResX, PlayResY, ScaledBorderAndShadow, comments, etc.)
+     * - [V4+ Styles] (Every single original Style line intact)
+     * - Any other metadata sections
+     * Only the Dialogue events in [Events] are updated with current cue timings/text.
+     */
+    fun rebuildAssPreservingOriginalStructure(
+        originalAss: String,
+        updatedCues: List<SubtitleCue>
+    ): String {
+        val lines = originalAss.lines()
+        val headerSb = StringBuilder()
+        var foundEvents = false
+        var formatFound = false
+
+        for (line in lines) {
+            val trimmed = line.trim()
+            if (trimmed.startsWith("[Events]", ignoreCase = true)) {
+                foundEvents = true
+                headerSb.appendLine("[Events]")
+                continue
+            }
+            if (foundEvents) {
+                if (trimmed.startsWith("Format:", ignoreCase = true)) {
+                    formatFound = true
+                    headerSb.appendLine(trimmed)
+                    break
+                }
+            } else {
+                headerSb.appendLine(line)
+            }
+        }
+
+        if (!foundEvents) {
+            return generateAss(
+                title = "remsubs_hardsub",
+                subtitles = updatedCues,
+                style = SubtitleStyle()
+            )
+        }
+
+        if (!formatFound) {
+            headerSb.appendLine("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text")
+        }
+
+        val playResY = SubtitleParser.extractScriptResolution(originalAss)?.second ?: 1080
+
+        for (cue in updatedCues.sortedBy { it.startTimeMs }) {
+            val startStr = formatAssTimestamp(cue.startTimeMs)
+            val endStr = formatAssTimestamp(cue.endTimeMs)
+            val styleName = cue.styleName.ifBlank { "Default" }
+            val actor = cue.actor
+            val layer = cue.layer
+            val marginL = cue.marginL
+            val marginR = cue.marginR
+            val marginV = cue.marginV
+            val effect = cue.effect
+            val formattedText = formatCueTextForAss(cue, playResY)
+
+            headerSb.appendLine("Dialogue: $layer,$startStr,$endStr,$styleName,$actor,$marginL,$marginR,$marginV,$effect,$formattedText")
+        }
+
+        return headerSb.toString()
+    }
+
     private fun formatCueTextForAss(cue: SubtitleCue, playResY: Int): String {
         val rawOrClean = if (cue.rawText.isNotBlank()) cue.rawText else cue.cleanText
         // Convert any HTML formatting tags (<i>, <b>, <font>, <br>) to standard ASS override tags

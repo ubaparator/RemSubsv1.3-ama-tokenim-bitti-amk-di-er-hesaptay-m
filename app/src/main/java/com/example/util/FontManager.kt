@@ -128,6 +128,65 @@ object FontManager {
         }
     }
 
+    fun findMatchingCustomFont(context: Context, requestedFontName: String): File? {
+        val cleanName = requestedFontName.trim()
+        if (cleanName.isBlank()) return null
+        val cleanNoSpace = cleanName.replace(" ", "").lowercase(java.util.Locale.ROOT)
+
+        val allFonts = getAllCustomFonts(context)
+        for (fontFile in allFonts) {
+            val meta = FontMetadataParser.extractFontNames(fontFile)
+            val names = meta.allDistinctNames + listOfNotNull(meta.familyName, meta.fullName, meta.typographicFamily, fontFile.nameWithoutExtension)
+            for (name in names) {
+                if (name.equals(cleanName, ignoreCase = true) ||
+                    name.replace(" ", "").equals(cleanNoSpace, ignoreCase = true) ||
+                    name.contains(cleanName, ignoreCase = true) ||
+                    cleanName.contains(name, ignoreCase = true)
+                ) {
+                    return fontFile
+                }
+            }
+        }
+        return null
+    }
+
+    fun findMatchingFontFamily(context: Context, requestedFontName: String): FontFamily? {
+        val customFile = findMatchingCustomFont(context, requestedFontName)
+        if (customFile != null) {
+            val fam = createFontFamilyFromFile(customFile)
+            if (fam != null) return fam
+        }
+        if (requestedFontName.contains("montserrat", ignoreCase = true)) {
+            val montserratFile = File(context.cacheDir, "montserrat.ttf")
+            if (!montserratFile.exists()) {
+                try {
+                    context.resources.openRawResource(com.example.R.font.montserrat).use { input ->
+                        FileOutputStream(montserratFile).use { output -> input.copyTo(output) }
+                    }
+                } catch (_: Exception) {}
+            }
+            if (montserratFile.exists()) {
+                val fam = createFontFamilyFromFile(montserratFile)
+                if (fam != null) return fam
+            }
+        }
+        if (requestedFontName.contains("roboto", ignoreCase = true)) {
+            val robotoFile = File(context.cacheDir, "roboto.ttf")
+            if (!robotoFile.exists()) {
+                try {
+                    context.resources.openRawResource(com.example.R.font.roboto).use { input ->
+                        FileOutputStream(robotoFile).use { output -> input.copyTo(output) }
+                    }
+                } catch (_: Exception) {}
+            }
+            if (robotoFile.exists()) {
+                val fam = createFontFamilyFromFile(robotoFile)
+                if (fam != null) return fam
+            }
+        }
+        return null
+    }
+
     fun getFileName(context: Context, uri: Uri): String? {
         var name: String? = null
         if (uri.scheme == "content") {

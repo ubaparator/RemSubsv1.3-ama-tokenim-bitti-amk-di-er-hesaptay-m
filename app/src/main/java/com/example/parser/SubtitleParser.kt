@@ -187,6 +187,9 @@ object SubtitleParser {
                 val actorStr = colMap["name"] ?: ""
                 val layerStr = colMap["layer"] ?: "0"
                 val marginVStr = colMap["marginv"] ?: "0"
+                val marginLStr = colMap["marginl"] ?: "0"
+                val marginRStr = colMap["marginr"] ?: "0"
+                val effectStr = colMap["effect"] ?: ""
 
                 val startMs = parseAssTimestamp(startStr)
                 val endMs = parseAssTimestamp(endStr)
@@ -204,7 +207,10 @@ object SubtitleParser {
                                 styleName = styleStr,
                                 layer = layerStr.toIntOrNull() ?: 0,
                                 marginV = marginVStr.toIntOrNull() ?: 0,
-                                actor = actorStr
+                                marginL = marginLStr.toIntOrNull() ?: 0,
+                                marginR = marginRStr.toIntOrNull() ?: 0,
+                                actor = actorStr,
+                                effect = effectStr
                             )
                         )
                     }

@@ -9,7 +9,10 @@ data class SubtitleCue(
     val styleName: String = "Default",
     val layer: Int = 0,
     val marginV: Int = 0,
+    val marginL: Int = 0,
+    val marginR: Int = 0,
     val actor: String = "",
+    val effect: String = "",
     // Individual single-cue custom positioning & styling:
     val customPositionEnabled: Boolean = false,
     val customVerticalAlign: SubtitleVerticalAlign = SubtitleVerticalAlign.BOTTOM,
