@@ -2,9 +2,13 @@ package com.example
 
 import android.Manifest
 import android.content.ActivityNotFoundException
+import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -13,6 +17,9 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.ViewModelProvider
+import com.example.util.FontManager
+import java.util.Locale
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
@@ -94,15 +101,160 @@ import com.example.update.UpdateState
 import java.io.File
 
 class MainActivity : ComponentActivity() {
+
+    companion object {
+        private const val TAG = "MainActivity"
+    }
+
+    private val viewModel: AxiSubViewModel by lazy {
+        ViewModelProvider(this)[AxiSubViewModel::class.java]
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        handleIncomingFileIntent(intent)
         setContent {
             MyApplicationTheme {
-                AxiSubMainScreen()
+                AxiSubMainScreen(viewModel = viewModel)
             }
         }
     }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIncomingFileIntent(intent)
+    }
+
+    private fun handleIncomingFileIntent(incomingIntent: Intent?) {
+        if (incomingIntent == null) return
+        val action = incomingIntent.action
+        if (action != Intent.ACTION_VIEW && action != Intent.ACTION_SEND) {
+            return
+        }
+
+        val uri: Uri? = incomingIntent.data
+            ?: incomingIntent.clipData?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.uri
+            ?: if (action == Intent.ACTION_SEND) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    incomingIntent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    incomingIntent.getParcelableExtra(Intent.EXTRA_STREAM)
+                }
+            } else null
+
+        if (uri == null) return
+
+        // Maintain read permissions across activity lifecycle (Scoped Storage & ContentProvider)
+        try {
+            val flags = incomingIntent.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION
+            if (flags != 0 && uri.scheme == "content") {
+                contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+        } catch (_: Throwable) {
+            // Persistable permissions might not be offered by all third-party file managers,
+            // the transient Intent permission grant remains active.
+        }
+
+        val mimeType = incomingIntent.type
+        openExternalFileUri(uri, mimeType)
+    }
+
+    private fun openExternalFileUri(uri: Uri, intentMimeType: String?) {
+        val detectedType = detectFileType(this, uri, intentMimeType)
+        Log.i(TAG, "[ExternalFile] Incoming URI=$uri, MIME=$intentMimeType, detected=$detectedType")
+
+        when (detectedType) {
+            ExternalFileType.ASS -> {
+                viewModel.loadSubtitleFromUri(uri)
+                viewModel.navigateToEditor()
+            }
+            ExternalFileType.SRT -> {
+                viewModel.loadSubtitleFromUri(uri)
+                viewModel.navigateToEditor()
+            }
+            ExternalFileType.MP4 -> {
+                viewModel.loadLocalVideo(uri)
+                viewModel.navigateToEditor()
+            }
+            ExternalFileType.UNKNOWN -> {
+                // Fallback for edge-case URIs
+                val contentMime = try { contentResolver.getType(uri) } catch (_: Throwable) { null }
+                if (contentMime?.startsWith("video/") == true) {
+                    viewModel.loadLocalVideo(uri)
+                    viewModel.navigateToEditor()
+                } else {
+                    viewModel.loadSubtitleFromUri(uri)
+                    viewModel.navigateToEditor()
+                }
+            }
+        }
+    }
+}
+
+enum class ExternalFileType {
+    ASS,
+    SRT,
+    MP4,
+    UNKNOWN
+}
+
+fun detectFileType(context: Context, uri: Uri, intentMimeType: String?): ExternalFileType {
+    val fileName = (FontManager.getFileName(context, uri) ?: uri.lastPathSegment ?: "").lowercase(Locale.ROOT)
+
+    // 1. Direct extension matching
+    if (fileName.endsWith(".ass") || fileName.endsWith(".ssa")) {
+        return ExternalFileType.ASS
+    }
+    if (fileName.endsWith(".srt")) {
+        return ExternalFileType.SRT
+    }
+    if (fileName.endsWith(".mp4") || fileName.endsWith(".m4v")) {
+        return ExternalFileType.MP4
+    }
+
+    // 2. MIME type matching from Intent or ContentResolver
+    val mime = (intentMimeType ?: try { context.contentResolver.getType(uri) } catch (_: Throwable) { null })
+        ?.lowercase(Locale.ROOT)
+
+    when {
+        mime == "text/x-ssa" || mime == "application/x-ass" || mime == "text/x-ass" -> return ExternalFileType.ASS
+        mime == "application/x-subrip" || mime == "text/x-srt" || mime == "text/srt" || mime == "application/x-srt" -> return ExternalFileType.SRT
+        mime == "video/mp4" || (mime != null && mime.startsWith("video/")) -> return ExternalFileType.MP4
+    }
+
+    // 3. Content sniffing fallback for generic MIME types (text/plain, */*, application/octet-stream)
+    try {
+        context.contentResolver.openInputStream(uri)?.use { stream ->
+            val buffer = ByteArray(4096)
+            val bytesRead = stream.read(buffer)
+            if (bytesRead > 0) {
+                // Check for MP4 ftyp box in first few bytes
+                if (bytesRead >= 8) {
+                    val box = String(buffer, 4, 4, Charsets.US_ASCII)
+                    if (box == "ftyp") {
+                        return ExternalFileType.MP4
+                    }
+                }
+                val textSample = String(buffer, 0, bytesRead, Charsets.UTF_8)
+                if (textSample.contains("[Script Info]", ignoreCase = true) ||
+                    textSample.contains("[V4+ Styles]", ignoreCase = true) ||
+                    textSample.contains("Dialogue:", ignoreCase = true)
+                ) {
+                    return ExternalFileType.ASS
+                }
+                if (textSample.contains("-->") && Regex("^\\s*\\d+\\s*[\r\n]+", RegexOption.MULTILINE).containsMatchIn(textSample)) {
+                    return ExternalFileType.SRT
+                }
+            }
+        }
+    } catch (e: Throwable) {
+        Log.w("detectFileType", "Content sniffing exception: ${e.localizedMessage}")
+    }
+
+    return ExternalFileType.UNKNOWN
 }
 
 @OptIn(ExperimentalMaterial3Api::class)

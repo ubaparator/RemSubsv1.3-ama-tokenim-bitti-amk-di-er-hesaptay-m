@@ -373,12 +373,26 @@ class AxiSubViewModel(application: Application) : AndroidViewModel(application) 
             val context = getApplication<Application>()
             try {
                 val fileName = FontManager.getFileName(context, uri) ?: "altyazi.ass"
-                val rawContent = context.contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }?.removePrefix("\uFEFF")
+                val rawContent = try {
+                    context.contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
+                } catch (e: Exception) {
+                    if (uri.scheme == "file" && uri.path != null) {
+                        try {
+                            File(uri.path!!).bufferedReader(Charsets.UTF_8).use { it.readText() }
+                        } catch (_: Exception) { null }
+                    } else null
+                }?.removePrefix("\uFEFF")
+
                 if (rawContent != null) {
                     val cues = SubtitleParser.parse(rawContent.byteInputStream(Charsets.UTF_8), fileName)
-                    val isSrt = fileName.lowercase().endsWith(".srt")
+                    val isSrt = fileName.lowercase().endsWith(".srt") ||
+                            (!rawContent.contains("[Events]") && !rawContent.contains("Dialogue:") && rawContent.contains("-->"))
                     val targetFileName = if (isSrt) {
-                        fileName.replace(Regex("(?i)\\.srt$"), ".ass")
+                        if (fileName.lowercase().endsWith(".srt")) {
+                            fileName.replace(Regex("(?i)\\.srt$"), ".ass")
+                        } else {
+                            "$fileName.ass"
+                        }
                     } else {
                         fileName
                     }
