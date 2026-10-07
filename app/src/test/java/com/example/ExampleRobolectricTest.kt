@@ -163,5 +163,44 @@ class ExampleRobolectricTest {
     assertEquals(com.example.ui.AppScreen.EDITOR, vm.uiState.value.currentScreen)
     assertEquals(android.net.Uri.fromFile(tempVideo), vm.uiState.value.videoUri)
   }
+
+  @Test
+  fun `test manifest universal scheme intent filter resolves without mime type`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val pm = context.packageManager
+
+    // Intent without MIME type using content scheme
+    val contentIntent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+      data = android.net.Uri.parse("content://media/external/files/999")
+      addCategory(android.content.Intent.CATEGORY_DEFAULT)
+    }
+    val contentResolvers = pm.queryIntentActivities(contentIntent, 0)
+    org.junit.Assert.assertTrue("Manifest should resolve content scheme without MIME", contentResolvers.any { it.activityInfo.name == MainActivity::class.java.name })
+
+    // Intent without MIME type using file scheme
+    val fileIntent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+      data = android.net.Uri.parse("file:///sdcard/Download/test.ass")
+      addCategory(android.content.Intent.CATEGORY_DEFAULT)
+    }
+    val fileResolvers = pm.queryIntentActivities(fileIntent, 0)
+    org.junit.Assert.assertTrue("Manifest should resolve file scheme without MIME", fileResolvers.any { it.activityInfo.name == MainActivity::class.java.name })
+  }
+
+  @Test
+  fun `test extension takes precedence over octet-stream and wildcard MIME`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+
+    val srtUri = android.net.Uri.parse("content://com.android.providers/movie.srt")
+    assertEquals(ExternalFileType.SRT, detectFileType(context, srtUri, "application/octet-stream"))
+    assertEquals(ExternalFileType.SRT, detectFileType(context, srtUri, "*/*"))
+
+    val assUri = android.net.Uri.parse("file:///storage/emulated/0/subs.ass")
+    assertEquals(ExternalFileType.ASS, detectFileType(context, assUri, "application/octet-stream"))
+    assertEquals(ExternalFileType.ASS, detectFileType(context, assUri, "*/*"))
+
+    val mp4Uri = android.net.Uri.parse("content://com.android.providers/video.mp4")
+    assertEquals(ExternalFileType.MP4, detectFileType(context, mp4Uri, "application/octet-stream"))
+    assertEquals(ExternalFileType.MP4, detectFileType(context, mp4Uri, "*/*"))
+  }
 }
 

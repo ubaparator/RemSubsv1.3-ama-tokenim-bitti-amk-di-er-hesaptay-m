@@ -163,6 +163,14 @@
                 <data android:pathPattern=".*\\.mp4" />
                 <data android:pathPattern=".*\\.MP4" />
             </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+            </intent-filter>
         </activity>
 
         <service

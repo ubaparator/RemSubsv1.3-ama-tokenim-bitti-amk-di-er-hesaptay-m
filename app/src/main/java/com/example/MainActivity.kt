@@ -113,7 +113,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        handleIncomingFileIntent(intent)
+        handleExternalFileIntent(intent)
         setContent {
             MyApplicationTheme {
                 AxiSubMainScreen(viewModel = viewModel)
@@ -124,32 +124,18 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        handleIncomingFileIntent(intent)
+        handleExternalFileIntent(intent)
     }
 
-    private fun handleIncomingFileIntent(incomingIntent: Intent?) {
-        if (incomingIntent == null) return
-        val action = incomingIntent.action
-        if (action != Intent.ACTION_VIEW && action != Intent.ACTION_SEND) {
-            return
-        }
-
-        val uri: Uri? = incomingIntent.data
-            ?: incomingIntent.clipData?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.uri
-            ?: if (action == Intent.ACTION_SEND) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    incomingIntent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
-                } else {
-                    @Suppress("DEPRECATION")
-                    incomingIntent.getParcelableExtra(Intent.EXTRA_STREAM)
-                }
-            } else null
-
-        if (uri == null) return
+    private fun handleExternalFileIntent(intent: Intent?) {
+        if (intent == null) return
+        val uri: Uri = intent.data
+            ?: intent.clipData?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.uri
+            ?: return
 
         // Maintain read permissions across activity lifecycle (Scoped Storage & ContentProvider)
         try {
-            val flags = incomingIntent.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION
+            val flags = intent.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION
             if (flags != 0 && uri.scheme == "content") {
                 contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
@@ -158,13 +144,8 @@ class MainActivity : ComponentActivity() {
             // the transient Intent permission grant remains active.
         }
 
-        val mimeType = incomingIntent.type
-        openExternalFileUri(uri, mimeType)
-    }
-
-    private fun openExternalFileUri(uri: Uri, intentMimeType: String?) {
-        val detectedType = detectFileType(this, uri, intentMimeType)
-        Log.i(TAG, "[ExternalFile] Incoming URI=$uri, MIME=$intentMimeType, detected=$detectedType")
+        val detectedType = detectFileType(this, uri, intent.type)
+        Log.i(TAG, "[ExternalFile] Incoming URI=$uri, MIME=${intent.type}, detected=$detectedType")
 
         when (detectedType) {
             ExternalFileType.ASS -> {
@@ -180,15 +161,8 @@ class MainActivity : ComponentActivity() {
                 viewModel.navigateToEditor()
             }
             ExternalFileType.UNKNOWN -> {
-                // Fallback for edge-case URIs
-                val contentMime = try { contentResolver.getType(uri) } catch (_: Throwable) { null }
-                if (contentMime?.startsWith("video/") == true) {
-                    viewModel.loadLocalVideo(uri)
-                    viewModel.navigateToEditor()
-                } else {
-                    viewModel.loadSubtitleFromUri(uri)
-                    viewModel.navigateToEditor()
-                }
+                // Sadece .ass, .srt, .mp4 dosyaları kabul edilir.
+                Log.w(TAG, "[ExternalFile] Desteklenmeyen dosya: $uri")
             }
         }
     }
@@ -204,7 +178,8 @@ enum class ExternalFileType {
 fun detectFileType(context: Context, uri: Uri, intentMimeType: String?): ExternalFileType {
     val fileName = (FontManager.getFileName(context, uri) ?: uri.lastPathSegment ?: "").lowercase(Locale.ROOT)
 
-    // 1. Direct extension matching
+    // 1. Uzantı kontrolü MIME type'dan ÖNCE yapılsın
+    // Dosya yöneticisi MIME type'ı "application/octet-stream" veya "*/*" gönderse bile uzantı ".ass/.srt/.mp4" ise dosyayı aç
     if (fileName.endsWith(".ass") || fileName.endsWith(".ssa")) {
         return ExternalFileType.ASS
     }
@@ -226,32 +201,34 @@ fun detectFileType(context: Context, uri: Uri, intentMimeType: String?): Externa
     }
 
     // 3. Content sniffing fallback for generic MIME types (text/plain, */*, application/octet-stream)
-    try {
-        context.contentResolver.openInputStream(uri)?.use { stream ->
-            val buffer = ByteArray(4096)
-            val bytesRead = stream.read(buffer)
-            if (bytesRead > 0) {
-                // Check for MP4 ftyp box in first few bytes
-                if (bytesRead >= 8) {
-                    val box = String(buffer, 4, 4, Charsets.US_ASCII)
-                    if (box == "ftyp") {
-                        return ExternalFileType.MP4
+    if (mime == "text/plain" || mime == "application/octet-stream" || mime == "*/*" || mime == null) {
+        try {
+            context.contentResolver.openInputStream(uri)?.use { stream ->
+                val buffer = ByteArray(4096)
+                val bytesRead = stream.read(buffer)
+                if (bytesRead > 0) {
+                    // Check for MP4 ftyp box in first few bytes
+                    if (bytesRead >= 8) {
+                        val box = String(buffer, 4, 4, Charsets.US_ASCII)
+                        if (box == "ftyp") {
+                            return ExternalFileType.MP4
+                        }
+                    }
+                    val textSample = String(buffer, 0, bytesRead, Charsets.UTF_8)
+                    if (textSample.contains("[Script Info]", ignoreCase = true) ||
+                        textSample.contains("[V4+ Styles]", ignoreCase = true) ||
+                        textSample.contains("Dialogue:", ignoreCase = true)
+                    ) {
+                        return ExternalFileType.ASS
+                    }
+                    if (textSample.contains("-->") && Regex("^\\s*\\d+\\s*[\r\n]+", RegexOption.MULTILINE).containsMatchIn(textSample)) {
+                        return ExternalFileType.SRT
                     }
                 }
-                val textSample = String(buffer, 0, bytesRead, Charsets.UTF_8)
-                if (textSample.contains("[Script Info]", ignoreCase = true) ||
-                    textSample.contains("[V4+ Styles]", ignoreCase = true) ||
-                    textSample.contains("Dialogue:", ignoreCase = true)
-                ) {
-                    return ExternalFileType.ASS
-                }
-                if (textSample.contains("-->") && Regex("^\\s*\\d+\\s*[\r\n]+", RegexOption.MULTILINE).containsMatchIn(textSample)) {
-                    return ExternalFileType.SRT
-                }
             }
+        } catch (e: Throwable) {
+            Log.w("detectFileType", "Content sniffing exception: ${e.localizedMessage}")
         }
-    } catch (e: Throwable) {
-        Log.w("detectFileType", "Content sniffing exception: ${e.localizedMessage}")
     }
 
     return ExternalFileType.UNKNOWN
